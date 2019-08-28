@@ -1,8 +1,13 @@
 #!/bin/sh
 
-RESULTS=$1
-DBNAME=$2
-USER=$3
+RESULTS=${1:-./results}
+DBNAME=${2:-tpch_origin}
+USER=${3:-$USER}
+HOST=${4:-localhost}
+PORT=${5:-9997}
+
+PSQLCMD="$HOME/tmp_basedir_for_pgsql_bld/bin/psql -h $HOST -p $PORT -d $DBNAME -U $USER"
+echo "$PSQLCMD"
 
 # delay between stats collections (iostat, vmstat, ...)
 DELAY=15
@@ -13,55 +18,45 @@ DSS_TIMEOUT=300 # 5 minutes in seconds
 # log
 LOGFILE=bench.log
 
-function benchmark_run() {
-
-	mkdir -p $RESULTS
+function benchmark_prepare() {
 
 	# store the settings
-	psql -h localhost postgres -c "select name,setting from pg_settings" > $RESULTS/settings.log 2> $RESULTS/settings.err
-
-	print_log "preparing TPC-H database"
+	$PSQLCMD -c "select name,setting from pg_settings" > $RESULTS/settings.log 2> $RESULTS/settings.err
 
 	# create database, populate it with data and set up foreign keys
-	# psql -h localhost tpch < dss/tpch-create.sql > $RESULTS/create.log 2> $RESULTS/create.err
+    #$PSQLCMD < dss/tpch-create.sql > $RESULTS/create.log 2> $RESULTS/create.err
 
 	print_log "  loading data"
 
-	psql -h localhost -U $USER $DBNAME < dss/tpch-load.sql > $RESULTS/load.log 2> $RESULTS/load.err
+	$PSQLCMD < dss/tpch-load.sql > $RESULTS/load.log 2> $RESULTS/load.err
 
 	print_log "  creating primary keys"
 
-	psql -h localhost -U $USER $DBNAME < dss/tpch-pkeys.sql > $RESULTS/pkeys.log 2> $RESULTS/pkeys.err
+	$PSQLCMD < dss/tpch-pkeys.sql > $RESULTS/pkeys.log 2> $RESULTS/pkeys.err
 
 	print_log "  creating foreign keys"
 
-	psql -h localhost -U $USER $DBNAME < dss/tpch-alter.sql > $RESULTS/alter.log 2> $RESULTS/alter.err
+	$PSQLCMD < dss/tpch-alter.sql > $RESULTS/alter.log 2> $RESULTS/alter.err
 
 	print_log "  creating indexes"
 
-	psql -h localhost -U $USER $DBNAME < dss/tpch-index.sql > $RESULTS/index.log 2> $RESULTS/index.err
+	$PSQLCMD < dss/tpch-index.sql > $RESULTS/index.log 2> $RESULTS/index.err
 
 	print_log "  analyzing"
 
-	psql -h localhost -U $USER $DBNAME -c "analyze" > $RESULTS/analyze.log 2> $RESULTS/analyze.err
-
-	print_log "running TPC-H benchmark"
-
-	benchmark_dss $RESULTS
-
-	print_log "finished TPC-H benchmark"
+	$PSQLCMD -c "analyze" > $RESULTS/analyze.log 2> $RESULTS/analyze.err
 
 }
 
-function benchmark_dss() {
+function benchmark_run() {
 
-	mkdir -p $RESULTS
+    print_log "running TPC-H benchmark"
 
-	mkdir $RESULTS/vmstat-s $RESULTS/vmstat-d $RESULTS/explain $RESULTS/results $RESULTS/errors
+	mkdir -p $RESULTS/vmstat-s $RESULTS/vmstat-d $RESULTS/explain $RESULTS/results $RESULTS/errors
 
 	# get bgwriter stats
-	psql postgres -c "SELECT * FROM pg_stat_bgwriter" > $RESULTS/stats-before.log 2>> $RESULTS/stats-before.err
-	psql postgres -c "SELECT * FROM pg_stat_database WHERE datname = '$DBNAME'" >> $RESULTS/stats-before.log 2>> $RESULTS/stats-before.err
+	$PSQLCMD -c "SELECT * FROM pg_stat_bgwriter" > $RESULTS/stats-before.log 2>> $RESULTS/stats-before.err
+	$PSQLCMD -c "SELECT * FROM pg_stat_database WHERE datname = '$DBNAME'" >> $RESULTS/stats-before.log 2>> $RESULTS/stats-before.err
 
 	vmstat -s > $RESULTS/vmstat-s-before.log 2>&1
 	vmstat -d > $RESULTS/vmstat-d-before.log 2>&1
@@ -81,13 +76,13 @@ function benchmark_dss() {
 			echo "======= query $n =======" >> $RESULTS/data.log 2>&1;
 
 			# run explain
-			psql -h localhost -U $USER $DBNAME < $qe > $RESULTS/explain/$n 2>> $RESULTS/explain.err
+			$PSQLCMD < $qe > $RESULTS/explain/$n 2>> $RESULTS/explain.err
 
 			vmstat -s > $RESULTS/vmstat-s/before-$n.log 2>&1
 			vmstat -d > $RESULTS/vmstat-d/before-$n.log 2>&1
 
 			# run the query on background
-			/usr/bin/time -a -f "$n = %e" -o $RESULTS/results.log psql -h localhost -U $USER $DBNAME < $q > $RESULTS/results/$n 2> $RESULTS/errors/$n &
+			/usr/bin/time -a -f "$n = %e" -o $RESULTS/results.log $PSQLCMD < $q > $RESULTS/results/$n 2> $RESULTS/errors/$n &
 
 			# wait up to the given number of seconds, then terminate the query if still running (don't wait for too long)
 			for i in `seq 0 $DSS_TIMEOUT`
@@ -102,13 +97,13 @@ function benchmark_dss() {
 						print_log "    killing query $n (timeout)"
 
 						# echo "$q : timeout" >> $RESULTS/results.log
-						psql -h localhost postgres -c "SELECT pg_terminate_backend(procpid) FROM pg_stat_activity WHERE datname = 'tpch'" >> $RESULTS/queries.err 2>&1;
+						$PSQLCMD -c "SELECT pg_terminate_backend(procpid) FROM pg_stat_activity WHERE datname = '$DBNAME'" >> $RESULTS/queries.err 2>&1;
 
 						# time to do a cleanup
 						sleep 10;
 
 						# just check how many backends are there (should be 0)
-						psql -h localhost postgres -c "SELECT COUNT(*) AS tpch_backends FROM pg_stat_activity WHERE datname = 'tpch'" >> $RESULTS/queries.err 2>&1;
+						$PSQLCMD -c "SELECT COUNT(*) AS tpch_backends FROM pg_stat_activity WHERE datname = '$DBNAME'" >> $RESULTS/queries.err 2>&1;
 
 					else
 						# the query is still running and we have time left, sleep another second
@@ -133,18 +128,18 @@ function benchmark_dss() {
 	done;
 
 	# collect stats again
-	psql postgres -c "SELECT * FROM pg_stat_bgwriter" > $RESULTS/stats-after.log 2>> $RESULTS/stats-after.err
-	psql postgres -c "SELECT * FROM pg_stat_database WHERE datname = '$DBNAME'" >> $RESULTS/stats-after.log 2>> $RESULTS/stats-after.err
+	$PSQLCMD -c "SELECT * FROM pg_stat_bgwriter" > $RESULTS/stats-after.log 2>> $RESULTS/stats-after.err
+	$PSQLCMD -c "SELECT * FROM pg_stat_database WHERE datname = '$DBNAME'" >> $RESULTS/stats-after.log 2>> $RESULTS/stats-after.err
 
 	vmstat -s > $RESULTS/vmstat-s-after.log 2>&1
 	vmstat -d > $RESULTS/vmstat-d-after.log 2>&1
+
+    print_log "finished TPC-H benchmark"
 
 }
 
 function stat_collection_start()
 {
-
-	local RESULTS=$1
 
 	# run some basic monitoring tools (iotop, iostat, vmstat)
 	for dev in $DEVICES
@@ -170,19 +165,21 @@ function stat_collection_stop()
 
 function print_log() {
 
-	local message=$1
+	local message=$@
 
 	echo `date +"%Y-%m-%d %H:%M:%S"` "["`date +%s`"] : $message" >> $RESULTS/$LOGFILE;
 
 }
 
-mkdir $RESULTS;
+mkdir -p $RESULTS;
 
 # start statistics collection
-stat_collection_start $RESULTS
+stat_collection_start
 
 # run the benchmark
-benchmark_run $RESULTS $DBNAME $USER
+benchmark_prepare
+
+benchmark_run
 
 # stop statistics collection
 stat_collection_stop
